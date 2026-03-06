@@ -1,0 +1,271 @@
+from aws_cdk import(
+	App,
+	Stack,
+	Environment,
+	aws_ec2 as ec2,
+	aws_elasticloadbalancingv2 as elbv2,
+	aws_elasticloadbalancingv2_targets as elbv2_targets,
+	aws_iam as iam,
+	aws_s3 as s3,
+)
+from constructs import Construct
+from aws_cdk import Duration
+
+class RegionA(Stack):
+	def __init__(self, core: Construct, id: str, **kwargs) -> None:
+		super().__init__(core, id, **kwargs)
+
+		#User Datas
+		user_data_ec2 = ec2.UserData.for_linux()
+		user_data_ec2.add_commands(
+			"yum -y update",
+			"yum -y install httpd",
+			"systemctl enable httpd",
+			"systemctl start httpd"
+		)
+
+		user_data_s3 = ec2.UserData.for_linux()
+		user_data_s3.add_commands(
+			"yum -y update",
+			"yum -y install httpd",
+			"systemctl enable httpd",
+			"systemctl start httpd"
+		)
+
+		#RegionA VPC
+		vpc = ec2.Vpc(
+			self,
+			'vpc-a',
+			max_azs=2,
+			nat_gateways=1,
+			subnet_configuration=[
+				ec2.SubnetConfiguration(
+					name="SubnetA",
+					subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS
+				),
+				ec2.SubnetConfiguration(
+					name="SubnetB",
+					subnet_type=ec2.SubnetType.PUBLIC
+				)
+			]
+		)
+
+		#S3 Bucket
+		bucket = s3.Bucket(
+			self,
+			'region-a-bucket'
+		)
+		
+		role = iam.Role(
+			self,
+			'RegionAs3Role',
+			assumed_by=iam.ServicePrincipal("ec2.amazonaws.com")
+		)
+
+		bucket.grant_read_write(role)
+
+		#EC2 Security Group
+		ec2_sg = ec2.SecurityGroup(
+			self,
+			'ec2_sg',
+			vpc=vpc,
+			description="Allow SSH + HTTP to EC2",
+			allow_all_outbound=True
+		)
+
+		ec2_sg.add_ingress_rule(
+			ec2.Peer.any_ipv4(),
+			ec2.Port.tcp(22),
+			"Allow SSH"
+		)
+
+		#RegionA ALB
+		alb = elbv2.ApplicationLoadBalancer(
+			self,
+			"RegionAalb",
+			vpc=vpc,
+			internet_facing=True
+		)
+
+		ec2_sg.connections.allow_from(
+			alb,
+			ec2.Port.tcp(80),
+			description="Allow HTTP from ALB"
+		)
+	
+		listener = alb.add_listener(
+			'RegionAListener',
+			port=80,
+			open=True
+		)
+
+		#RegionA Instances
+		instances=[]
+
+		for i in range(4):
+			instance = ec2.Instance(
+				self,
+				f"RegionAInstance{i}",
+				instance_type=ec2.InstanceType('t3.micro'),
+				machine_image=ec2.AmazonLinuxImage(),
+				vpc=vpc,
+				vpc_subnets=ec2.SubnetSelection(
+					subnet_group_name="SubnetA"
+				),
+				security_group=ec2_sg,
+				user_data=user_data_ec2
+			)
+			instances.append(instance)
+
+		solo_a_instance = ec2.Instance(
+				self,
+				'RegionASoloInstance',
+				instance_type=ec2.InstanceType('t3.micro'),
+				machine_image=ec2.AmazonLinuxImage(),
+				vpc=vpc,
+				vpc_subnets=ec2.SubnetSelection(
+					subnet_group_name="SubnetB"
+				),
+				security_group=ec2_sg,
+				role=role,
+				user_data=user_data_s3
+		)
+		instances.append(solo_a_instance)
+
+		#Target Group and Health Checks
+		listener.add_targets(
+			'RegionAHealthCheck',
+			port=80,
+			targets=[elbv2_targets.InstanceTarget(i.instance_id) for i in instances],
+			health_check=elbv2.HealthCheck(
+				path="/",
+				port="80",
+				healthy_http_codes="200-399",
+				interval=Duration.seconds(30),
+				timeout=Duration.seconds(5),
+				healthy_threshold_count=2
+			)
+		)
+
+class RegionB(Stack):
+	def __init__(self, core: Construct, id: str, **kwargs) -> None:
+		super().__init__(core, id, **kwargs)
+
+		#User Datas
+		user_data_ec2 = ec2.UserData.for_linux()
+		
+		user_data.add_commands(
+			"yum -y update",
+			"yum -y install httpd",
+			"systemctl enable httpd",
+			"systemctl start httpd"
+		)
+		
+		#RegionB VPC
+		vpc = ec2.Vpc(
+			self,
+			'RegionBVpc',
+			max_azs=2,
+			nat_gateways=1,
+			subnet_configuration=[
+				ec2.SubnetConfiguration(
+					name="SubnetC",
+					subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS
+				),
+				ec2.SubnetConfiguration(
+					name="SubnetD",
+					subnet_type=ec2.SubnetType.PUBLIC
+				)
+			]
+		)
+
+		#Security Group
+		ec2_sg = ec2.SecurityGroup(
+			self,
+			'RegionB_sg',
+			vpc=vpc,
+			description="Allow SSH + HTTP from ALB",
+			allow_all_outbound=True
+		)
+
+		ec2_sg.add_ingress_rule(
+			ec2.Peer.any_ipv4(),
+			ec2.Port.tcp(22),
+			"Allow SSH"
+		)
+
+		#RegionB alb
+		alb = elbv2.ApplicationLoadBalancer(
+			self,
+			'RegionBALB',
+			vpc=vpc,
+			internet_facing=True
+		)
+
+		ec2_sg.connections.allow_from(
+			alb,
+			ec2.Port.tcp(80),
+			description="Allow ALB to EC2"
+		)
+
+		listener = alb.add_listener(
+			'RegionBListener',
+			port=80,
+			open=True
+		)
+
+		#RegionB Instances
+		instances=[]
+
+		for i in range(4):
+			instance = ec2.Instance(
+				self,
+				f"Instance{i}",
+				instance_type=ec2.InstanceType('t3.micro'),
+				machine_image=ec2.AmazonLinuxImage(),
+				vpc=vpc,
+				vpc_subnet=ec2.SubnetSelection(
+					subnet_group_name="SubnetC"
+				),
+				security_group=ec2_sg,
+				user_data=user_data_ec2
+			)
+			instances.append(instance)
+
+		solo_B_instance = ec2.Instance(
+			self,
+			'RegionBSoloInstance',
+			instance_type=ec2.InstanceType('t3.micro'),
+			machine_image=ec2.AmazonLinuxImage(),
+			vpc=vpc,
+			vpc_subnet=ec2.SubnetSelection(
+				subnet_group_name="SubnetD"
+			),
+			security_group=ec2_sg,
+			user_data=user_data_ec2
+		)
+		instances.append(solo_B_instance)
+
+		#target groups and health checks
+		listener.add_targets(
+			'RegionBListener',
+			port=80,
+			targets=[elbv2_targets.InstanceTarget(i.instance_id) for i in instances],
+			health_checks=elbv2.HealthCheck(
+				path='/',
+				port=80,
+				healthy_http_codes='200-399',
+				interval=Duration.seconds(30),
+				timeout=Duration.seconds(5),
+				healthy_threshold_count=2
+			)
+		)
+
+app = App()
+
+RegionA(app, 'RegionAStack',
+	env=Environment(account_number="123456789012", region="us-west-1b")
+RegionB(app, 'RegionBStack',
+	env=Environment(acoount_number="123456789012", region="us-west-1c")
+
+app.synth()
