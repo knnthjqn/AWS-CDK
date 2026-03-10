@@ -1,0 +1,236 @@
+from aws-cdk import(
+	Stack, 
+	Duration,
+	RemovalPolicy,
+	Environment,
+	aws_ec2 as ec2,
+	aws_autoscaling as autoscaling,
+	aws_elasticloadbalancing as elbv2
+	aws_rds as rds,
+	aws_s3 as s3,
+	aws_cloudfront as cloudfront
+	aws_cloudfront_origins as origins,
+	aws_backup as backup
+)
+from constructs import Construct
+
+class TwoTier(Stack):
+	def __init__(self, core: Construct, id: str, **kwargs) -> None:
+		super().__init__(core, id, **kwargs)
+
+		vpc = ec2.Vpc(
+			self,
+			'testVpc',
+			max_azs=2,
+			nat_gateways=1
+		)
+
+		#s3 Buckets
+		static_bucket=s3.Bucket(
+			self,
+			'static-bucket',
+			block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
+			encryption=s3.BucketEncryption.S3_MANAGED,
+			versioned=True,
+			removal_policy=RemovalPolicy.RETAIN
+		)
+
+		logs_bucket=s3.Bucket(
+			self,
+			'logs-bucket',
+			block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
+			encryption=s3.BucketEncryption.S3_MANAGED,
+			versioned=True,
+			removal_policy=RemovalPolicy.RETAIN
+		)
+
+		#SG's
+		asg_sg = ec2.SecurityGroup(
+			self,
+			'asg_sg',
+			vpc=vpc,
+			allow_all_outbound=True
+		)
+
+		alb_sg = ec2.SecurityGroup(
+			self,
+			'alb_sg',
+			vpc=vpc,
+			allow_all_outbound
+		)
+
+		rds_sg = ec2.SecurityGroup(
+			self,
+			'rds_sg',
+			vpc=vpc,
+			allow_all_outbound
+		)
+
+		alb_sg.add_ingress_rule(
+			ec2.Peer.any_ipv4(),
+			ec2.Port.tcp(80),
+			'Allow internet access to ALB'
+		)
+
+		#Application Load Balancer
+		alb = elbv2.ApplicationLoadBalancer(
+			self,
+			'alb',
+			internet_facing=True,
+			vpc=vpc,
+			vpc_subnet=ec2.SubnetSelection(
+				subnet_type=ec2.SubnetType.PUBLIC
+			)
+		)
+
+		#alb access s3 bucket
+		alb.log_access_logs(
+			logs_bucket,
+			prefix="alb/"
+		)
+
+		listener = alb.add_listener(
+			'HTTP Listener',
+			port=80,
+			open=True
+		)
+
+		#EC2 Launch Template
+		lt = ec2.LaunchTemplate(
+			self,
+			'lt_instance',
+			instance_type=ec2.InstanceType('t3.micro'),
+			machine_image=ec2.AmazonLinuxImage(),
+			security_group=asg_sg,
+			block_devices=[
+				ec2.BlockDevice(
+					device_name="/dev/xvda",
+					volume=ec2.BlockDeviceVolume,ebs(
+						volume_size=20,
+						encrypted=True,
+						delete_on_termination=True
+					),
+				ec2.BlockDevice(
+					device_name="/dev/xvdb",
+					volume=ec2.BlockDeviceVolume.ebs(
+						volume_size=50,
+						encrypted=True,
+						delete_on_termniation=True
+					)
+
+				)
+			]
+			
+	
+		)
+	
+		#ASG
+		asg = autoscaling.AutoScalingGroup(
+			self,
+			'asg',
+			vpc=vpc,
+			vpc_subnet=ec2.SubnetSelection(
+				subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS
+			),
+			min_capacity=2,
+			desired_capacity=4,
+			max_capacity=8,
+			launch_template=lt
+		)
+
+		asg.user_data.add_commands(
+			"yum -y update",
+			"yum -y install httpd",
+			"systemctl enable httpd",
+			"echo "OK" > /var/www/html/index.html",
+			"systemctl start httpd"
+		)
+
+		asg.connections.allow_from(
+			alb,
+			ec2.Port.tcp(80),
+			'Allow HTTP'
+		)
+
+		listener.add_targets(
+			'ALB-targets',
+			port="80",
+			targets=[asg],
+			health_check=elbv2.HealthCheck(
+				path="/",
+				healthy_http_codes='200-399',
+				interval=Duration.seconds(30),
+				timeout=Duration.seconds(5),
+				healthy_threshold_count=2
+			)
+		)
+
+		#RDS DB
+		db = rds.DatabaseInstance(
+			self,
+			'db',
+			engine=rds.DatabaseInstanceEngine.rds(
+				version=rds.MysqlEngineVersion.VER_8_0_36
+			),
+			vpc=vpc,
+			vpc_subnet=ec2.SubnetSelection(
+				subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS
+			),
+			security_group=[rds_sg],
+			publicly_accessible=False,
+			credentials=rds.Credentials.from_generated_secret("admin"),
+			allocated_storage=20,
+			max_allocated_storage=100,
+			backup_retention=Duration.days(7),
+			delete_protection=True
+		)
+
+		rds.connections.allow_from(
+			asg_sg,
+			"ASG to RDS"
+		)
+
+		#CloudFront Distribution
+		cloudfront = cloudfront.Distribution(
+			self,
+			"cf",
+			default_behavior=cloudfront.BehaviorOptions(
+				origins=origins.S3Origin(static_bucket),
+				viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+				cache_policy=cloudfront.CachePolicy.CACHING_OPTIMIZED
+			),
+			enable_logging=True,
+			log_bucket=logs_bucket,
+			log_bucket_prefix="cloudfront/"
+		)
+
+app = App()
+
+TwoTier(app, 'TwoTierArchitecture',
+	env=Environment(account_number="123456789012", region="us-west-1a")
+
+app.synth()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
